@@ -34,7 +34,7 @@ DEFAULTS = {
     "fish": None, "rod": None,       # {"hex", "lo", "hi"}
     "steer": True, "deadzone": 0.15,
     "f_repeat": 0.0,                 # 0 = press F once each time a state is entered
-    "blue_min": 0.02, "grey_min": 0.06, "white_min": 0.008,
+    "blue_min": 0.02, "grey_min": 0.06, "white_min": 0.025,
     "act": {"IDLE": True, "HOOKED": True, "RESULT": True},
 }
 
@@ -48,8 +48,18 @@ if user32:
     user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM) if user32 else None
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM) if user32 else None
+    HWND_TOPMOST = -1
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE = 0x0010, 0x0002, 0x0001
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 
+def pin_on_top_no_focus(title):
+    """Make a window always-on-top without stealing focus from it."""
+    h = find_hwnd(title)
+    if h:
+        user32.SetWindowPos(h, wintypes.HWND(HWND_TOPMOST), 0, 0, 0, 0,
+                             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
 
 def list_windows():
     found = []
@@ -224,7 +234,7 @@ def load_cfg():
     return cfg
 
 
-def tap(key, hold=0.05):
+def tap(key, hold=1):
     pydirectinput.keyDown(key)
     time.sleep(hold)
     pydirectinput.keyUp(key)
@@ -445,6 +455,10 @@ class App:
         if "toggle" in self.req:
             self.req.discard("toggle")
             self.toggle()
+        if "dbg_off" in self.req:            # debug window was closed with the X
+            self.req.discard("dbg_off")
+            self.dbg_var.set(False)
+            
         s = self.status
         self.st_lbl.config(text=f"state: {s['state']}   ({'RUNNING' if self.armed else 'stopped - detect only'})")
         if s["ratios"]:
@@ -463,6 +477,9 @@ class App:
         fr, fr_t = None, 0
         pend, pend_since, conf = "NONE", 0, "NONE"
         fired, last_press, dbg_open = False, 0, False
+        pend, pend_since, conf = "NONE", 0, "NONE"
+        fired, last_press, dbg_open = False, 0, False
+        awaiting_bite = False
 
         def release():
             pydirectinput.keyUp("a")
@@ -520,15 +537,23 @@ class App:
                 if pend != conf and now - pend_since >= 0.25:       # must hold steady for 0.25s
                     conf, fired = pend, False
                 if armed and conf in STATES and cfg["act"].get(conf) and now - last_press >= 0.6:
-                    rep = cfg["f_repeat"]
-                    if not fired or (rep > 0 and now - last_press >= rep):
-                        tap("f")
-                        fired, last_press = True, time.time()
+                    if conf == "IDLE" and awaiting_bite:
+                        pass  # already cast - ignore the identical-looking idle icon until we see a real state change
+                    else:
+                        rep = cfg["f_repeat"]
+                        if not fired or (rep > 0 and now - last_press >= rep):
+                            tap("f")
+                            fired, last_press = True, time.time()
+                            if conf == "IDLE":
+                                awaiting_bite = True
+                            elif conf in ("HOOKED", "RESULT"):
+                                awaiting_bite = False
 
                 self.status = {"state": conf if conf != "NONE" else st, "ratios": ratios,
                                "bar": bar_txt, "msg": ""}
 
                 # ---- optional debug preview
+                                # ---- optional debug preview
                 if self.debug and frame is not None:
                     view = frame.copy()
                     if fs:
@@ -538,7 +563,14 @@ class App:
                         cv2.line(view, (cx, 0), (cx, view.shape[0]), (0, 0, 255), 1)
                     cv2.imshow("debug", cv2.resize(view, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST))
                     cv2.waitKey(1)
+                    if not dbg_open:                     # just opened this cycle
+                        pin_on_top_no_focus("debug")
                     dbg_open = True
+                    # closed via the window's own [X] -> reflect that in the checkbox
+                    if cv2.getWindowProperty("debug", cv2.WND_PROP_VISIBLE) < 1:
+                        self.debug = False
+                        self.req.add("dbg_off")
+                        dbg_open = False
                 elif dbg_open:
                     cv2.destroyWindow("debug")
                     dbg_open = False
