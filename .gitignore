@@ -1,2 +1,51 @@
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Node dependencies
+node_modules/
+
+# Frontend build output
+dist/
+dist-ssr/
+
+# Local environment/config
+*.local
+.env
+.env.*
+!.env.example
+
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+
+# PyInstaller build output
+build/
+
+# Local application configuration
 fishbot_gui_cfg.json
-FISHBOT_HANDOFF.md
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# OS / temporary files
+*.tmp
+*.temp
