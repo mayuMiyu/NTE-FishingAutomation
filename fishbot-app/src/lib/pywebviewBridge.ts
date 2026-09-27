@@ -7,7 +7,12 @@ import type {
   ColorCalibration,
 } from "./fishbotBridge";
 
-export function installPywebviewBridge(timeoutMs = 1500): Promise<void> {
+/**
+ * pywebview dispatches `pywebviewready` on window, not document.  Listening
+ * on document meant a cold start could miss the native API and the app would
+ * quietly fall back to its browser preview bridge.
+ */
+export function installPywebviewBridge(timeoutMs = 10_000): Promise<void> {
   return new Promise((resolve) => {
     if ((window as any).pywebview?.api) {
       window.fishbot = buildBridge();
@@ -16,15 +21,15 @@ export function installPywebviewBridge(timeoutMs = 1500): Promise<void> {
     }
 
     const onReady = () => {
-      document.removeEventListener("pywebviewready", onReady);
+      window.removeEventListener("pywebviewready", onReady);
       window.fishbot = buildBridge();
       resolve();
     };
-    document.addEventListener("pywebviewready", onReady);
+    window.addEventListener("pywebviewready", onReady, { once: true });
 
     // Not running inside pywebview at all (plain browser dev) - don't hang forever.
     setTimeout(() => {
-      document.removeEventListener("pywebviewready", onReady);
+      window.removeEventListener("pywebviewready", onReady);
       resolve();
     }, timeoutMs);
   });
@@ -75,6 +80,15 @@ function buildBridge(): FishbotBridge {
     },
     async relaunchAsAdmin(): Promise<void> {
       await api.relaunch_as_admin();
+    },
+    async minimizeWindow(): Promise<void> {
+      await api.minimize_window();
+    },
+    async toggleMaximizeWindow(): Promise<void> {
+      await api.toggle_maximize_window();
+    },
+    async closeWindow(): Promise<void> {
+      await api.close_window();
     },
   };
 }

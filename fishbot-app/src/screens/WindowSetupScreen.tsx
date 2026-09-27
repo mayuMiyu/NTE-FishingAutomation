@@ -113,20 +113,6 @@ export function WindowSetupScreen() {
               Continue
             </motion.button>
 
-            <button
-              onClick={() => {
-                setManualList(null);
-                selectWindow(gameWindow!).then(() => {});
-                // Force manual list open even though NTE was found, in case it's the wrong window.
-                setLoadingList(true);
-                listWindows()
-                  .then(setManualList)
-                  .finally(() => setLoadingList(false));
-              }}
-              className={`text-xs underline ${isMinimal ? "text-neutral-500 hover:text-neutral-300" : "text-pink-400 hover:text-pink-500"}`}
-            >
-              Not the right window? Choose manually
-            </button>
           </motion.div>
         )}
 

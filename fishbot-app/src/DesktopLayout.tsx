@@ -2,23 +2,19 @@ import { Outlet, useLocation } from "react-router";
 import { motion } from "motion/react";
 import { Minus, Square, X, Fish, Waves } from "lucide-react";
 import { useTheme } from "./context/themeContext";
+import { getFishbotBridge } from "./lib/fishbotBridge";
 
 export function DesktopLayout() {
   const location = useLocation();
   const { theme } = useTheme();
   const isMinimal = theme === "minimal";
+  const nativeWindow = getFishbotBridge();
 
   return (
-    <div className={`min-h-screen flex items-center justify-center p-4 transition-colors duration-500 ${
+    <div className={`h-screen w-screen overflow-hidden flex flex-col transition-colors duration-500 ${
       isMinimal ? "bg-neutral-900 text-neutral-200" : "bg-[#fce7f3] text-purple-900"
     }`}>
-      <div className={`w-[400px] h-[600px] rounded-xl shadow-2xl overflow-hidden flex flex-col relative ring-1 transition-all duration-500 ${
-        isMinimal
-          ? "bg-[#0A0A0A] border border-neutral-800 ring-white/5"
-          : "bg-[#fff0f5] border-[3px] border-pink-200 ring-pink-300/30 shadow-[0_10px_50px_rgba(244,114,182,0.25)]"
-      }`}>
-
-        <div className={`h-10 flex items-center justify-between px-4 select-none z-50 ${
+        <div className={`pywebview-drag-region h-10 shrink-0 flex items-center justify-between px-4 select-none z-50 ${
           isMinimal ? "bg-[#0A0A0A] border-b border-neutral-800/50" : "bg-white/80 backdrop-blur-md border-b-2 border-pink-100"
         }`}>
           <div className={`text-xs font-medium tracking-wide flex items-center gap-2 ${
@@ -28,9 +24,9 @@ export function DesktopLayout() {
             Fishbot
           </div>
           <div className={`flex items-center gap-4 ${isMinimal ? "text-neutral-500" : "text-pink-300"}`}>
-            <Minus className="w-4 h-4 cursor-pointer hover:text-neutral-200" />
-            <Square className="w-3.5 h-3.5 cursor-pointer hover:text-neutral-200" />
-            <X className="w-4 h-4 cursor-pointer hover:text-red-500" />
+            <button type="button" aria-label="Minimize" className="cursor-pointer hover:text-neutral-200" onClick={() => void nativeWindow.minimizeWindow()}><Minus className="w-4 h-4" /></button>
+            <button type="button" aria-label="Maximize or restore" className="cursor-pointer hover:text-neutral-200" onClick={() => void nativeWindow.toggleMaximizeWindow()}><Square className="w-3.5 h-3.5" /></button>
+            <button type="button" aria-label="Close" className="cursor-pointer hover:text-red-500" onClick={() => void nativeWindow.closeWindow()}><X className="w-4 h-4" /></button>
           </div>
         </div>
 
@@ -56,7 +52,6 @@ export function DesktopLayout() {
             <Outlet />
           </motion.div>
         </div>
-      </div>
     </div>
   );
 }

@@ -116,6 +116,11 @@ export interface FishbotBridge {
 
   isAdmin(): Promise<boolean>;
   relaunchAsAdmin(): Promise<void>;
+
+  /** Native-window controls. These are no-ops in the browser preview. */
+  minimizeWindow(): Promise<void>;
+  toggleMaximizeWindow(): Promise<void>;
+  closeWindow(): Promise<void>;
 }
 
 declare global {
@@ -216,6 +221,15 @@ function createMockBridge(): FishbotBridge {
       return false;
     },
     async relaunchAsAdmin() {
+      // no-op in mock
+    },
+    async minimizeWindow() {
+      // no-op in mock
+    },
+    async toggleMaximizeWindow() {
+      // no-op in mock
+    },
+    async closeWindow() {
       // no-op in mock
     },
   };

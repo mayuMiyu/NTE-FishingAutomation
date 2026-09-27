@@ -1,24 +1,24 @@
-"""
-Fishbot desktop host: opens the built React UI (fishbot-app/dist) in a
-native pywebview window and exposes the detection/steering engine to it as
-a JS-callable API (window.pywebview.api.*), matching src/lib/pywebviewBridge.ts
-on the frontend side.
-
-Run after building the UI:
-    cd fishbot-app && npm run build && cd ..
-    python host.py
-
-Requires: pip install pywebview opencv-python mss numpy pydirectinput keyboard
-Windows only (uses ctypes/user32 for window lookup, same as fishbot.py).
-"""
-
 import ctypes
 import json
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
+import winreg
 from ctypes import wintypes
 from pathlib import Path
+
+# pywebview's Windows backends are not reliable on Python 3.14 yet.  Check
+# before importing it so a wrong interpreter produces an actionable message
+# instead of an intermittent backend crash.
+if not getattr(sys, "frozen", False) and sys.version_info[:2] != (3, 12):
+    raise SystemExit(
+        "Fishbot must be run with Python 3.12.x.\n"
+        f"Current interpreter: {sys.executable} ({sys.version.split()[0]})\n"
+        "Build/run it with your Python 3.12 installation, not the Python on PATH."
+    )
 
 import cv2
 import numpy as np
@@ -39,11 +39,8 @@ except Exception:
 
 pydirectinput.PAUSE = 0
 
-# When run as a plain script, "here" is this file's folder. When frozen by
-# PyInstaller (--onefile), bundled data (--add-data) is unpacked at runtime
-# into sys._MEIPASS instead, and CFG_FILE should live next to the actual
-# .exe (sys.executable) so settings persist between runs, not inside the
-# temp unpack folder that PyInstaller wipes.
+# Frozen (PyInstaller) paths differ from script paths - config lives next to
+# the exe, bundled UI lives in the temp unpack dir (_MEIPASS).
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS)
     CFG_DIR = Path(sys.executable).parent
@@ -54,7 +51,69 @@ else:
 CFG_FILE = CFG_DIR / "fishbot_gui_cfg.json"
 DIST_INDEX = BASE_DIR / "fishbot-app" / "dist" / "index.html"
 
+_WEBVIEW2_REG_KEYS = (
+    r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+)
+_WEBVIEW2_BOOTSTRAPPER_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+MB_YESNO, MB_ICONWARNING, MB_ICONERROR, IDYES = 0x4, 0x30, 0x10, 6
+
+
+def _is_webview2_installed():
+    for key_path in _WEBVIEW2_REG_KEYS:
+        try:
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+            return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def ensure_webview2():
+    if _is_webview2_installed():
+        return True
+
+    choice = ctypes.windll.user32.MessageBoxW(
+        None,
+        "Fishbot needs the Microsoft Edge WebView2 Runtime to run, and it "
+        "wasn't found on this PC.\n\n"
+        "This is a small, official Microsoft component (not related to the "
+        "Edge browser itself) - Fishbot will not start without it.\n\n"
+        "Install it now?",
+        "Fishbot - Missing Component",
+        MB_YESNO | MB_ICONWARNING,
+    )
+    if choice != IDYES:
+        ctypes.windll.user32.MessageBoxW(
+            None, "Fishbot can't run without WebView2. Closing.", "Fishbot", MB_ICONERROR
+        )
+        return False
+
+    try:
+        tmp_path = Path(tempfile.gettempdir()) / "MicrosoftEdgeWebview2Setup.exe"
+        urllib.request.urlretrieve(_WEBVIEW2_BOOTSTRAPPER_URL, tmp_path)
+        subprocess.run([str(tmp_path)], check=False)
+    except Exception as e:
+        ctypes.windll.user32.MessageBoxW(
+            None, f"Couldn't install WebView2 automatically:\n{e}\n\n"
+            "Please install it manually from Microsoft's site, then relaunch Fishbot.",
+            "Fishbot - Install Failed", MB_ICONERROR,
+        )
+        return False
+
+    if not _is_webview2_installed():
+        ctypes.windll.user32.MessageBoxW(
+            None, "WebView2 still isn't detected. Please relaunch Fishbot after installing it.",
+            "Fishbot", MB_ICONERROR,
+        )
+        return False
+    return True
+
+
 STATES = ("IDLE", "HOOKED", "RESULT")
+DEBUG_WINDOW_TITLE = "Fishbot debug preview"
+CALIBRATION_DELAY_SECONDS = 3
+F_HOLD_SECONDS = 1.0
 
 DEFAULT_CONFIG = {
     "window_title": "",
@@ -68,11 +127,9 @@ DEFAULT_CONFIG = {
     "debug_preview": False,
 }
 
-# per-color HSV tolerance (hue, sat, val) - rod is tighter, pale yellow gets
-# mimicked by sunset clouds. See FISHBOT_HANDOFF.md §3.
+# HSV tolerance (hue, sat, val) per color.
 TOL = {"fish": (10, 70, 70), "rod": (8, 50, 60)}
 
-# ---------------------------------------------------------------- win32 helpers (ported from fishbot.py)
 user32 = ctypes.windll.user32
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsIconic.argtypes = [wintypes.HWND]
@@ -82,6 +139,12 @@ user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+HWND_TOPMOST = -1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+]
 
 
 def list_windows_raw():
@@ -111,14 +174,23 @@ def find_hwnd(title):
     return None
 
 
+def pin_window_on_top_no_focus(title):
+    """Keep a diagnostic OpenCV window visible without stealing game focus."""
+    hwnd = find_hwnd(title)
+    if hwnd:
+        user32.SetWindowPos(
+            hwnd, wintypes.HWND(HWND_TOPMOST), 0, 0, 0, 0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+        )
+
+
 _primary = {}
 
 
 def frame_rect(title):
-    """(left, top, width, height) of the game's client area, or None."""
     if not title:
         if not _primary:
-            with mss.mss() as s:
+            with mss.MSS() as s:
                 m = s.monitors[1]
             _primary.update(m)
         return _primary["left"], _primary["top"], _primary["width"], _primary["height"]
@@ -134,7 +206,6 @@ def frame_rect(title):
     return pt.x, pt.y, rc.right, rc.bottom
 
 
-# ---------------------------------------------------------------- vision helpers (ported from fishbot.py)
 def rel_to_abs(rel, fr):
     l, t, w, h = fr
     return {
@@ -144,7 +215,7 @@ def rel_to_abs(rel, fr):
 
 
 def grab(sct, region):
-    return np.array(sct.grab(region))[:, :, :3]  # BGR
+    return np.array(sct.grab(region))[:, :, :3]
 
 
 def hex_of(bgr):
@@ -191,11 +262,14 @@ def classify(img, cfg):
 
 
 def snapshot(cfg):
+    # The pywebview call runs on its own thread, so this countdown keeps the
+    # desktop UI responsive while giving the user time to switch to NTE.
+    time.sleep(CALIBRATION_DELAY_SECONDS)
     fr = frame_rect(cfg["window_title"])
     if not fr:
         raise RuntimeError("Game window not found / minimized.")
     l, t, w, h = fr
-    with mss.mss() as sct:
+    with mss.MSS() as sct:
         img = grab(sct, {"left": l, "top": t, "width": w, "height": h})
     if winsound:
         winsound.Beep(1000, 120)
@@ -213,8 +287,6 @@ def select_roi(img, title):
 
 
 def pick_colors(roi, items):
-    """Zoomed eyedropper. items = [(key, label)]. Rejects sat<80 clicks
-    (sky/grey) and re-prompts, per FISHBOT_HANDOFF.md §5.1's fix."""
     scale = max(1, 1200 // roi.shape[1])
     big = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
     banner, out = 30, {}
@@ -239,7 +311,7 @@ def pick_colors(roi, items):
             bgr = roi[min(y, roi.shape[0] - 1), min(x, roi.shape[1] - 1)]
             s = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0][1]
             if s < 80:
-                continue  # rejected: too grey/sky, re-ask
+                continue
             ht, st, vt = TOL[key]
             lo, hi = hsv_range(bgr, ht, st, vt)
             out[key] = {"hex": hex_of(bgr), "lo": lo, "hi": hi}
@@ -257,7 +329,6 @@ def retune(cfg):
             c["lo"], c["hi"] = hsv_range(bgr, *tol)
 
 
-# ---------------------------------------------------------------- config persistence
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if CFG_FILE.exists():
@@ -273,37 +344,36 @@ def save_config(cfg):
     CFG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-# ---------------------------------------------------------------- the exposed API
 class Api:
     def __init__(self):
         self.cfg = load_config()
         self.armed = False
         self.stop_flag = threading.Event()
-        self.window = None
-        self.debug_open = False
+        # Keep native objects private. pywebview recursively examines public
+        # attributes of js_api, and traversing a WinForms Window causes an
+        # AccessibilityObject recursion loop that freezes the app at launch.
+        self._window = None
+        self._window_is_maximized = False
         threading.Thread(target=self._bot_loop, daemon=True).start()
         keyboard.add_hotkey("f8", self._hotkey_toggle)
         keyboard.add_hotkey("f9", self._hotkey_quit)
 
     def set_window(self, w):
-        self.window = w  # webview.Window, set after create_window()
+        self._window = w
 
-    # ---- global hotkeys (F8 start/stop, F9 quit) - work even when the
-    # game window has focus, unlike clicking the app's own Start button
-    # (see FISHBOT_HANDOFF.md §5.4 on focus-stealing).
     def _hotkey_toggle(self):
         self.armed = not self.armed
         if not self.armed:
             pydirectinput.keyUp("a")
             pydirectinput.keyUp("d")
+            pydirectinput.keyUp("f")
 
     def _hotkey_quit(self):
         self.stop()
         self.stop_flag.set()
-        if self.window:
-            self.window.destroy()
+        if self._window:
+            self._window.destroy()
 
-    # ---- window discovery
     def find_window(self, title_hint):
         for title, hwnd in list_windows_raw():
             if title_hint.lower() in title.lower():
@@ -313,7 +383,6 @@ class Api:
     def list_windows(self):
         return [{"title": t, "hwnd": h} for t, h in list_windows_raw()]
 
-    # ---- config
     def get_config(self):
         return self.cfg
 
@@ -326,7 +395,6 @@ class Api:
         save_config(self.cfg)
         return self.cfg
 
-    # ---- run control
     def start(self):
         self.armed = True
 
@@ -334,6 +402,7 @@ class Api:
         self.armed = False
         pydirectinput.keyUp("a")
         pydirectinput.keyUp("d")
+        pydirectinput.keyUp("f")
 
     def is_admin(self):
         try:
@@ -342,11 +411,23 @@ class Api:
             return False
 
     def relaunch_as_admin(self):
-        import sys
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
 
-    # ---- calibration (opens native OpenCV windows, blocks the calling JS
-    # promise until the user finishes clicking)
+    def minimize_window(self):
+        if self._window:
+            self._window.minimize()
+
+    def toggle_maximize_window(self):
+        if self._window:
+            if self._window_is_maximized:
+                self._window.restore()
+            else:
+                self._window.maximize()
+            self._window_is_maximized = not self._window_is_maximized
+
+    def close_window(self):
+        self._hotkey_quit()
+
     def calibrate_bar(self):
         img, fr = snapshot(self.cfg)
         roi = select_roi(img, "Drag a TIGHT box around the grey track, then ENTER")
@@ -372,18 +453,28 @@ class Api:
         save_config(self.cfg)
         return fbtn
 
-    # ---- background worker: mirrors fishbot_gui_v3's bot_loop, pushes
-    # status to JS instead of drawing tkinter widgets
     def _bot_loop(self):
         held = None
         fr, fr_t = None, 0
         pend, pend_since, conf = "NONE", 0, "NONE"
         fired, last_press = False, 0
         awaiting_bite = False
+        f_held_until = 0.0
+        last_fish_center, last_fish_time, fish_velocity = None, None, 0.0
+        loops, loop_epoch, loops_per_sec = 0, time.perf_counter(), 0
+        debug_open = False
 
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             while not self.stop_flag.is_set():
                 now = time.time()
+                if f_held_until and now >= f_held_until:
+                    pydirectinput.keyUp("f")
+                    f_held_until = 0.0
+                loops += 1
+                elapsed = time.perf_counter() - loop_epoch
+                if elapsed >= 1.0:
+                    loops_per_sec = round(loops / elapsed)
+                    loops, loop_epoch = 0, time.perf_counter()
                 cfg = self.cfg
                 armed = self.armed
 
@@ -392,7 +483,7 @@ class Api:
                 if not fr:
                     self._push_status({
                         "state": "NONE", "armed": armed, "barFound": {"fish": False, "rod": False},
-                        "ratios": None, "err": None, "heldKey": None, "loopsPerSec": 0,
+                        "ratios": None, "err": None, "heldKey": None, "loopsPerSec": loops_per_sec,
                         "message": "game window not found",
                     })
                     time.sleep(0.3)
@@ -412,7 +503,17 @@ class Api:
                 want = None
                 if steering and armed and cfg["steer"]:
                     rod_x = (rs[0] + rs[1]) / 2
-                    err = rod_x - (fs[0] + fs[1]) / 2
+                    fish_center = (fs[0] + fs[1]) / 2
+                    if last_fish_center is not None and last_fish_time is not None:
+                        dt = now - last_fish_time
+                        if 0 < dt <= 0.25:
+                            # Smooth the estimate so one noisy detection does not cause
+                            # a full opposite-direction key press.
+                            instant_velocity = float(np.clip((fish_center - last_fish_center) / dt, -1500, 1500))
+                            fish_velocity = 0.35 * instant_velocity + 0.65 * fish_velocity
+                    last_fish_center, last_fish_time = fish_center, now
+                    predicted_center = fish_center + fish_velocity * max(0.0, cfg["lead"])
+                    err = rod_x - predicted_center
                     if cfg.get("invert_ad"):
                         err = -err
                     dz = max(3, (fs[1] - fs[0]) * cfg["deadzone"])
@@ -420,6 +521,8 @@ class Api:
                         want = "a"
                     elif err < -dz:
                         want = "d"
+                elif not steering:
+                    last_fish_center, last_fish_time, fish_velocity = None, None, 0.0
                 if want != held or not armed:
                     pydirectinput.keyUp("a")
                     pydirectinput.keyUp("d")
@@ -440,13 +543,42 @@ class Api:
                     pend, pend_since = st, now
                 if pend != conf and now - pend_since >= cfg["f_debounce"]:
                     conf, fired = pend, False
-                if armed and conf in STATES and cfg["act"].get(conf) and now - last_press >= cfg["f_min_gap"]:
+                if (
+                    armed and not f_held_until and conf in STATES and cfg["act"].get(conf)
+                    and now - last_press >= cfg["f_min_gap"]
+                ):
                     if not (conf == "IDLE" and awaiting_bite):
                         rep = cfg["f_repeat"]
                         if not fired or (rep > 0 and now - last_press >= rep):
-                            pydirectinput.press("f")
-                            fired, last_press = True, time.time()
-                            awaiting_bite = conf == "IDLE" or (conf in ("HOOKED", "RESULT") and False)
+                            pydirectinput.keyDown("f")
+                            f_held_until = now + F_HOLD_SECONDS
+                            fired, last_press = True, now
+                            awaiting_bite = conf == "IDLE"
+
+                # Optional native preview of the bar crop. It deliberately
+                # runs in the worker thread so closing it cannot block the
+                # pywebview UI thread or game controls.
+                if cfg.get("debug_preview") and frame is not None:
+                    view = frame.copy()
+                    if fs:
+                        cv2.rectangle(view, (int(fs[0]), 0), (int(fs[1]), view.shape[0] - 1), (255, 200, 0), 1)
+                    if rs:
+                        rod_center = int((rs[0] + rs[1]) / 2)
+                        cv2.line(view, (rod_center, 0), (rod_center, view.shape[0] - 1), (0, 0, 255), 1)
+                    cv2.putText(view, f"err {err:+.1f}px" if err is not None else "detecting", (5, 14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.imshow(DEBUG_WINDOW_TITLE, cv2.resize(view, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST))
+                    cv2.waitKey(1)
+                    if not debug_open:
+                        pin_window_on_top_no_focus(DEBUG_WINDOW_TITLE)
+                        debug_open = True
+                    if cv2.getWindowProperty(DEBUG_WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
+                        self.cfg["debug_preview"] = False
+                        save_config(self.cfg)
+                        debug_open = False
+                elif debug_open:
+                    cv2.destroyWindow(DEBUG_WINDOW_TITLE)
+                    debug_open = False
 
                 self._push_status({
                     "state": conf if conf != "NONE" else st,
@@ -455,28 +587,61 @@ class Api:
                     "ratios": ratios,
                     "err": round(err) if err is not None else None,
                     "heldKey": held,
-                    "loopsPerSec": 0,  # left as a future enhancement (see fishbot.py's live diagnostic line)
+                    "loopsPerSec": loops_per_sec,
                     "message": "",
                 })
 
                 time.sleep(0.005 if armed else 0.05)
 
+        pydirectinput.keyUp("a")
+        pydirectinput.keyUp("d")
+        pydirectinput.keyUp("f")
+        if debug_open:
+            cv2.destroyWindow(DEBUG_WINDOW_TITLE)
+
     def _push_status(self, status):
-        if self.window:
+        if self._window:
             try:
-                self.window.evaluate_js(f"window.__fishbotPushStatus && window.__fishbotPushStatus({json.dumps(status)})")
+                self._window.evaluate_js(f"window.__fishbotPushStatus && window.__fishbotPushStatus({json.dumps(status)})")
             except Exception:
                 pass
 
 
 def main():
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            args = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            # Relaunch the script with pythonw so that accepting UAC opens
+            # Fishbot directly, not a second console or an interactive >>>
+            # Python prompt. The script name must be included explicitly:
+            # sys.argv only contains it in the non-frozen process.
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            executable = str(pythonw if pythonw.exists() else Path(sys.executable))
+            args = subprocess.list2cmdline([str(Path(__file__).resolve()), *sys.argv[1:]])
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, args, str(BASE_DIR), 1
+        )
+        if result <= 32:
+            raise SystemExit("Administrator permission is required to run Fishbot.")
+        return
+
+    if not ensure_webview2():
+        sys.exit(1)
+
     if not DIST_INDEX.exists():
         raise SystemExit(f"Build the UI first: cd fishbot-app && npm run build\n(missing {DIST_INDEX})")
 
     api = Api()
-    window = webview.create_window("Fishbot", str(DIST_INDEX), width=440, height=640, js_api=api)
+    window = webview.create_window(
+        "Fishbot", str(DIST_INDEX), width=440, height=640,
+        # Only the React title strip is draggable.  Easy-drag makes every
+        # control in a frameless WebView compete with window dragging.
+        js_api=api, frameless=True, easy_drag=False,
+    )
     api.set_window(window)
-    webview.start()
+    webview.start(gui="edgechromium", debug=False)
 
 
 if __name__ == "__main__":

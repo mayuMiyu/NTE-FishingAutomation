@@ -1,0 +1,9 @@
+# Use with Python 3.12.x on Windows. Python 3.14 is intentionally unsupported
+# by host.py because pywebview's Windows backend has caused crashes there.
+opencv-python
+mss
+numpy
+pydirectinput
+keyboard
+pywebview
+pyinstaller
